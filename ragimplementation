@@ -1,0 +1,159 @@
+
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores.faiss import FAISS
+from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_core.documents import Document
+from rag import get_client, generate_content, get_google_client, get_langchain_client
+from langchain_core.tools import Tool, tool
+# (create_agent already imported above)
+from langchain_google_vertexai import ChatVertexAI
+# local llm client functions are provided by `rag` module
+from rag import get_client, generate_content, get_google_client, get_langchain_client
+from langchain.agents import create_agent
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_community.vectorstores import Chroma
+from langchain_anthropic import ChatAnthropic
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_core.output_parsers import StrOutputParser
+# Use the global client wrapper and LangChain LLM
+client_wrapper = get_client()
+
+
+raw = [
+    Document(page_content=(
+        "ACME annual leave policy: full-time employees receive 15 days of annual leave "
+        "after one year of employment. 16 days after 3 years, 18 days after 5 years, "
+        "20 days after 10 years. Unused leave can be carried over to June 30 of the "
+        "following year, after which it expires."),
+        metadata={"source": "HR/leave_policy_v3.md"}),
+    Document(page_content=(
+        "Special leave: 5 days for own marriage, 1 day for child's marriage, "
+        "10 days for spouse's childbirth, 5 days for death of own/spouse's parent, "
+        "3 days for death of grandparent. Family events such as a parent's 60th or 70th "
+        "birthday do not qualify for special leave and must be taken as annual leave."),
+        metadata={"source": "HR/special_leave.md"}),
+    Document(page_content=(
+        "Remote work: full-time employees can work from home twice a week. Manager "
+        "approval required in advance. Tue/Thu remote is discouraged (company-wide "
+        "meetings). New hires must come in every day for the first 3 months."),
+        metadata={"source": "HR/remote_work_policy.md"}),
+]
+
+# - Chunking
+
+splitter=RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=50,
+                                        separators=["\n\n", "\n", " ", ""]  )
+chunks = splitter.split_documents(raw)
+
+# embedding model for vector store
+
+emb=HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2", encode_kwargs={"normalize_embeddings": True})
+
+vectorstore = FAISS.from_documents(chunks, emb)
+
+# Retrieve relevant chunks for a query
+prompt = "What is the annual leave policy for employees after 5 years of employment?"
+query_embedding = emb.embed_query(prompt)  
+betterprompt=ChatPromptTemplate.from_messages([
+    ("system",
+    "You are a helpful assistant. Use the following context to answer the question.\n\n"
+     "If you don't know the answer, just say you don't know. Don't try to make up an answer.\n\n"
+     "At the End each answer with a summary of the source documents used to answer the question.\n\n"),
+     ("human","[reference documents]\n{context}\n\n[question]\n{question}")])
+
+   # ── 3) Embed + vector store ─────────────────────────────
+
+def _sanitize_documents(docs):
+    """Return a list of Documents whose page_content are strings.
+
+    This prevents downstream embedding code from receiving dicts or other
+    non-string types which call `.replace` on each text.
+    """
+    sanitized = []
+    for d in docs:
+        try:
+            content = d.page_content if hasattr(d, "page_content") else d.get("page_content")
+        except Exception:
+            content = d
+        if isinstance(content, dict):
+            # common keys used for text content
+            content = content.get("text") or content.get("content") or str(content)
+        sanitized.append(Document(page_content=str(content), metadata=getattr(d, "metadata", None) or (d.get("metadata") if isinstance(d, dict) else None)))
+    return sanitized
+
+emb = HuggingFaceEmbeddings(
+    model_name="BAAI/bge-m3",
+    encode_kwargs={"normalize_embeddings": True})
+
+# sanitize before passing into vector stores / embeddings
+sanitized_chunks = _sanitize_documents(chunks)
+vectorstore = FAISS.from_documents(sanitized_chunks, emb)
+vectordb = Chroma.from_documents(sanitized_chunks, emb, collection_name="acme_hr")
+results=vectorstore.similarity_search(prompt,k=3) #top 2 #similar #
+
+# ── 4) Retriever ────────────────────────────────────────
+retriever = vectordb.as_retriever(search_kwargs={"k": 3})
+# Note: You need to define 'llm' before using it in initialize_agent
+# Example: from langchain_google_genai import ChatgoogleGenerativeAI
+# Use the LangChain LLM as the agent model
+customclient = get_langchain_client()
+# Use the LangChain client returned by `get_langchain_client()` as the LLM
+# so we don't use ChatAnthropic here.
+llm = customclient
+
+def fmt_prompt_with_context(query: str, context_docs: list[Document]) -> str:
+    """Format the prompt with the retrieved context documents."""
+    context_text = "\n\n".join(
+        f"Source: {doc.metadata.get('source', 'unknown')}\nContent: {doc.page_content}"
+        for doc in context_docs
+    )
+    return f"{context_text}\n\nQuestion: {query}\nAnswer:"
+
+
+def _ensure_str_output(x):
+    """Normalize LLM output to a string for downstream parsers.
+
+    Many LLM run wrappers sometimes return dict-like responses (e.g. {'text': ...}
+    or {'content': ...}) instead of raw strings. `StrOutputParser` expects a
+    string and calls string methods like `replace` internally, so we must
+    extract the text here.
+    """
+    if isinstance(x, str):
+        return x
+    if isinstance(x, dict):
+        return x.get("text") or x.get("content") or str(x)
+    return str(x)
+
+# LCEL: LangChain Expression Language. Components are chained with `|`.
+# Same idea as `cat file | grep ... | wc -l` in a Unix shell.
+chain = (
+    {
+        # Ensure retriever is invoked with the question string only
+        # directly run a similarity search on the FAISS vectorstore with the question string
+        "context": RunnableLambda(lambda inp: vectorstore.similarity_search(
+            (inp["question"].get("text") if isinstance(inp["question"], dict) else inp["question"]),
+            k=3
+        )),
+        "question": RunnablePassthrough(),
+    }
+    | RunnableLambda(
+        lambda x: {
+            "context": fmt_prompt_with_context(x["question"], x["context"]),
+            "question": x["question"],
+        }
+    )
+    | betterprompt
+    | llm
+    | RunnableLambda(_ensure_str_output)
+    | StrOutputParser()
+)
+# ── Run ────────────────────────────────────────────────
+for q in [
+    "If my parent's 60th birthday falls in my first year, how many days of leave do I get?",
+    "How many days of annual leave does someone with 7 years of tenure get?",
+    "Can a new hire work from home?",
+    "Does the company cover lunch?",  # not in the docs → should refuse
+]:
+    print(f"\n━━━ Q: {q}\n> {chain.invoke({'question': q})}")
